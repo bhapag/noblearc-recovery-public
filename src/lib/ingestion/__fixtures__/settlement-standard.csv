@@ -1,0 +1,4 @@
+Order Number,Payout Date,Net Payout,Gross Order Value,Platform Commission,GST on Commission,Fixed Fee,TDS Amount,Promo Discount,Refund Amount,Cycle Ref,Status
+ORD-1001,05/09/2026,850.00,1000.00,120.00,21.60,5.00,3.40,0.00,0.00,CYC-38,DELIVERED
+ORD-1002,05/09/2026,412.75,485.00,58.20,10.48,5.00,1.65,0.00,0.00,CYC-38,DELIVERED
+ORD-1003,06/09/2026,0.00,300.00,36.00,6.48,5.00,0.00,0.00,300.00,CYC-38,CANCELLED

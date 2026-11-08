@@ -1,0 +1,1062 @@
+// NobleArc — Restaurant Aggregator Payout Recovery
+// Phase 0 data model. See CLAUDE.md and PROJECT_STATE.md for the product
+// principles and phase boundaries this schema was designed against.
+//
+// Money fields are always Decimal(14, 2) — never Float — per the deterministic,
+// 2-decimal-safe money handling requirement. Application arithmetic uses
+// src/lib/money.ts, never native JS number math, for anything touching these
+// fields.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Identity / provenance
+// ---------------------------------------------------------------------------
+
+/// Stand-in for a human or system user until real authentication exists.
+/// Every audit/provenance field below points at an Actor so that wiring up
+/// real auth later means mapping authenticated users to Actor rows, not
+/// restructuring foreign keys. Seed data must contain exactly one system
+/// Actor (isSystem = true) and no fake human actors.
+model Actor {
+  id       String  @id @default(uuid()) @db.Uuid
+  name     String
+  email    String? @unique
+  isSystem Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  uploadedFiles       SourceFile[]
+  createdCases        ReconciliationCase[]
+  classificationEvents ClassificationEvent[]
+  evidenceEntries     CaseEvidence[]
+
+  createdRecoveryCases      RecoveryCase[]
+  recoveryCaseEvents        RecoveryCaseEvent[]
+  evidenceItems             EvidenceItem[]
+  findingsReportsGenerated  FindingsReport[]           @relation("FindingsReportGeneratedBy")
+  findingsReportsSent       FindingsReport[]           @relation("FindingsReportSentBy")
+  recoveryCaseLinksLinked   RecoveryCaseReconciliationLink[] @relation("RecoveryCaseLinkLinkedBy")
+  recoveryCaseLinksReleased RecoveryCaseReconciliationLink[] @relation("RecoveryCaseLinkReleasedBy")
+
+  disputeSubmissionsCreated   DisputeSubmission[] @relation("DisputeSubmissionCreatedBy")
+  disputeSubmissionsSuperseded DisputeSubmission[] @relation("DisputeSubmissionSupersededBy")
+  followUpEntries             FollowUpEntry[]
+  dispositionsDecided         DisputeDisposition[]
+
+  recoveryEventsVerified RecoveryEvent[] @relation("RecoveryEventVerifiedBy")
+  recoveryEventsVoided   RecoveryEvent[] @relation("RecoveryEventVoidedBy")
+
+  @@map("actors")
+}
+
+/// Known aggregator platforms. A reference table, not an enum, so a new
+/// platform can be added with a row insert instead of a schema migration.
+/// Seed data only: Swiggy, Zomato, Other. Never store per-platform rates,
+/// fees, or deadlines here — those are case-specific evidence (CaseEvidence),
+/// never global "this is how Zomato always works" assumptions.
+model Aggregator {
+  id       String  @id @default(uuid()) @db.Uuid
+  name     String  @unique
+  slug     String  @unique
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  restaurantAccounts RestaurantAggregatorAccount[]
+  sourceFiles        SourceFile[]
+  settlementRecords  SettlementRecord[]
+  reconciliationCases ReconciliationCase[]
+  recoveryCases      RecoveryCase[]
+  deadlineAssumptionPolicies DeadlineAssumptionPolicy[]
+
+  @@map("aggregators")
+}
+
+/// A NobleArc restaurant client.
+model Restaurant {
+  id       String  @id @default(uuid()) @db.Uuid
+  name     String
+  code     String  @unique
+  notes    String?
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  aggregatorAccounts  RestaurantAggregatorAccount[]
+  sourceFiles         SourceFile[]
+  settlementRecords   SettlementRecord[]
+  posRecords          POSRecord[]
+  bankRecords         BankRecord[]
+  reconciliationCases ReconciliationCase[]
+  recoveryCases       RecoveryCase[]
+
+  @@map("restaurants")
+}
+
+/// One outlet/account a restaurant holds on an aggregator platform.
+/// Intentionally holds no credential fields of any kind — not a placeholder,
+/// a permanent exclusion. NobleArc never collects or stores aggregator
+/// passwords or API tokens.
+///
+/// Uniqueness note: a plain `@@unique([restaurantId, aggregatorId,
+/// externalOutletId])` would NOT actually prevent duplicate rows when
+/// externalOutletId is null — Postgres treats every NULL as distinct in a
+/// unique index. Real enforcement (one row per restaurant+aggregator when
+/// externalOutletId is null, plus one row per distinct externalOutletId
+/// otherwise) is added by hand as two partial unique indexes in the first
+/// migration's SQL, the same technique used for CaseRecordLink's
+/// exactly-one-FK constraint below.
+model RestaurantAggregatorAccount {
+  id               String  @id @default(uuid()) @db.Uuid
+  restaurantId     String  @db.Uuid
+  aggregatorId     String  @db.Uuid
+  externalOutletId String?
+  label            String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  restaurant Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Restrict)
+  aggregator Aggregator @relation(fields: [aggregatorId], references: [id], onDelete: Restrict)
+
+  @@index([restaurantId])
+  @@index([aggregatorId])
+  @@map("restaurant_aggregator_accounts")
+}
+
+// ---------------------------------------------------------------------------
+// Raw ingested records (populated by Phase 1 ingestion — empty until then)
+// ---------------------------------------------------------------------------
+
+enum RecordKind {
+  SETTLEMENT
+  POS
+  BANK
+}
+
+/// Provenance record for an ingested file (Phase 1). Extended from Phase 0's
+/// minimal version, which had no way to scope a file to a restaurant, locate
+/// its stored bytes, or detect a duplicate upload — none of which existed
+/// until Phase 1 ingestion behavior needed them.
+///
+/// `contentHash` (sha256 of the raw file bytes) + `restaurantId` back a
+/// duplicate-import warning, not a hard block: this is a plain index, never
+/// a unique constraint, so an intentional re-import (e.g. a corrected
+/// re-export of the same period) always stays possible with explicit
+/// confirmation — see src/lib/ingestion/commit-import.ts.
+///
+/// `storageKey` is an opaque locator meaningful only to the currently active
+/// FileStorage adapter (src/lib/ingestion/file-storage.ts) — never a raw
+/// filesystem path baked into application logic.
+///
+/// `mappingConfig` snapshots the source-column → canonical-field mapping
+/// actually used for this import, so the mapping decision itself is
+/// auditable later even though it is not re-applied automatically.
+model SourceFile {
+  id                String      @id @default(uuid()) @db.Uuid
+  filename          String
+  kind              RecordKind
+  restaurantId      String      @db.Uuid
+  aggregatorId      String?     @db.Uuid
+  contentHash       String
+  sizeBytes         Int
+  mimeType          String
+  storageKey        String
+  mappingConfig     Json
+  uploadedAt        DateTime    @default(now())
+  uploadedByActorId String      @db.Uuid
+
+  restaurant Restaurant  @relation(fields: [restaurantId], references: [id], onDelete: Restrict)
+  aggregator Aggregator? @relation(fields: [aggregatorId], references: [id], onDelete: Restrict)
+  uploadedBy Actor       @relation(fields: [uploadedByActorId], references: [id], onDelete: Restrict)
+
+  settlementRecords SettlementRecord[]
+  posRecords        POSRecord[]
+  bankRecords       BankRecord[]
+
+  @@index([kind, uploadedAt])
+  @@index([restaurantId, contentHash])
+  @@map("source_files")
+}
+
+/// A raw line from an aggregator settlement/payout report.
+/// `rawFields` shape (see src/lib/ingestion/types.ts): `{ sourceRowNumber,
+/// canonical: { <optional field key>: value } }` — only fields the user
+/// explicitly mapped, as decimal-safe strings for money. Never a blind dump
+/// of every source column; unmapped columns are not persisted at all
+/// (data minimization), and never a place for credentials or secrets.
+model SettlementRecord {
+  id           String   @id @default(uuid()) @db.Uuid
+  restaurantId String   @db.Uuid
+  aggregatorId String   @db.Uuid
+  date         DateTime
+  amount       Decimal  @db.Decimal(14, 2)
+  orderRef     String?
+  sourceFileId String?  @db.Uuid
+  rawFields    Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  restaurant Restaurant  @relation(fields: [restaurantId], references: [id], onDelete: Restrict)
+  aggregator Aggregator  @relation(fields: [aggregatorId], references: [id], onDelete: Restrict)
+  sourceFile SourceFile? @relation(fields: [sourceFileId], references: [id], onDelete: SetNull)
+
+  caseLinks CaseRecordLink[]
+  recoveryEvents RecoveryEvent[]
+
+  @@index([restaurantId, aggregatorId, date])
+  @@index([orderRef])
+  @@map("settlement_records")
+}
+
+/// A raw order row from the restaurant's POS system. `rawFields` shape: see
+/// SettlementRecord above.
+model POSRecord {
+  id           String   @id @default(uuid()) @db.Uuid
+  restaurantId String   @db.Uuid
+  date         DateTime
+  amount       Decimal  @db.Decimal(14, 2)
+  orderRef     String?
+  sourceFileId String?  @db.Uuid
+  rawFields    Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  restaurant Restaurant  @relation(fields: [restaurantId], references: [id], onDelete: Restrict)
+  sourceFile SourceFile? @relation(fields: [sourceFileId], references: [id], onDelete: SetNull)
+
+  caseLinks CaseRecordLink[]
+
+  @@index([restaurantId, date])
+  @@index([orderRef])
+  @@map("pos_records")
+}
+
+/// A raw line from a bank statement (e.g. an aggregator payout credit).
+/// `rawFields` shape: see SettlementRecord above.
+model BankRecord {
+  id           String   @id @default(uuid()) @db.Uuid
+  restaurantId String   @db.Uuid
+  date         DateTime
+  amount       Decimal  @db.Decimal(14, 2)
+  reference    String?
+  sourceFileId String?  @db.Uuid
+  rawFields    Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  restaurant Restaurant  @relation(fields: [restaurantId], references: [id], onDelete: Restrict)
+  sourceFile SourceFile? @relation(fields: [sourceFileId], references: [id], onDelete: SetNull)
+
+  caseLinks CaseRecordLink[]
+  recoveryEvents RecoveryEvent[]
+
+  @@index([restaurantId, date])
+  @@map("bank_records")
+}
+
+// ---------------------------------------------------------------------------
+// Reconciliation & mandatory human classification
+// (populated by Phase 2 behavior — empty until then; the schema exists now
+// so Phase 1/2 don't require structural migrations)
+// ---------------------------------------------------------------------------
+
+/// Human classification of a reconciliation case — the Phase 2 approved
+/// taxonomy (replaces Phase 0's placeholder values; the table was empty,
+/// zero rows, so this is a zero-data-loss change). UNCLASSIFIED is the only
+/// system-settable value (the column default) — every other value requires
+/// an explicit human action recorded as a ClassificationEvent. Nothing in
+/// application code may set a non-UNCLASSIFIED status directly; the default
+/// exists so a case can never be created without *some* status, not as a
+/// substitute for human review. REQUIRES_HUMAN_REVIEW also covers "not
+/// enough evidence to decide yet" — there is deliberately no separate value
+/// for that (see CLAUDE.md).
+enum ClassificationStatus {
+  UNCLASSIFIED
+  VALID_DEDUCTION
+  TIMING_DIFFERENCE
+  MISSING_DATA_UNMATCHED_ORDER
+  COMMERCIAL_RULE_DIFFERENCE
+  CONFIRMED_DISCREPANCY
+  REQUIRES_HUMAN_REVIEW
+}
+
+/// Why (or whether) this case has a computed expected amount. Case rows are
+/// always created — even when nothing can be calculated yet — so unmatched
+/// or evidence-starved items stay visible, filterable, and classifiable
+/// rather than being invented as a fake number or hidden from the operator.
+enum CalculationStatus {
+  CALCULATED
+  INSUFFICIENT_DATA
+  UNMATCHED
+}
+
+/// ORDER_LEVEL compares one order's expected-vs-actual settlement.
+/// BANK_CYCLE compares a settlement cycle's expected total against the
+/// actual bank credit. The two are never summed together into one number —
+/// each is its own case, its own classification, so one signal never
+/// silently absorbs or double-counts the other.
+enum ReconciliationScope {
+  ORDER_LEVEL
+  BANK_CYCLE
+}
+
+/// The unit of human review. `difference` is always application-computed via
+/// computeDifference() in src/lib/money.ts as (expected − actual): a positive
+/// value means the restaurant appears to be owed money. Never derive this
+/// sign convention ad hoc elsewhere — computeDifference is the single source
+/// of truth for it.
+///
+/// `expectedAmount`/`actualAmount` are independently nullable (not
+/// all-or-nothing): an unmatched settlement row has a known actualAmount but
+/// no computable expectedAmount. `difference` is non-null exactly when both
+/// are non-null, enforced by a hand-written CHECK constraint (see the
+/// migration SQL) alongside always being written via computeDifference().
+///
+/// Query note: aggregating "confirmed discrepancy" totals must always filter
+/// status = CONFIRMED_DISCREPANCY explicitly. Never sum every case regardless
+/// of status — unresolved (UNCLASSIFIED / REQUIRES_HUMAN_REVIEW) amounts
+/// must stay out of any "confirmed" total, and ORDER_LEVEL/BANK_CYCLE totals
+/// must never be summed together (see ReconciliationScope).
+///
+/// Recalculation creates a NEW row (see `supersedesCaseId`) rather than
+/// mutating this one — the old case and its full classification history
+/// remain permanently queryable. A superseding case always starts
+/// UNCLASSIFIED again: a changed calculation is new information.
+model ReconciliationCase {
+  id                           String               @id @default(uuid()) @db.Uuid
+  restaurantId                 String               @db.Uuid
+  aggregatorId                 String               @db.Uuid
+  scope                        ReconciliationScope
+  orderRef                     String?
+  periodStart                  DateTime?
+  periodEnd                    DateTime?
+  expectedAmount               Decimal?             @db.Decimal(14, 2)
+  actualAmount                 Decimal?             @db.Decimal(14, 2)
+  difference                   Decimal?             @db.Decimal(14, 2)
+  calculationStatus            CalculationStatus
+  calculationFormulaVersion    String
+  calculationBreakdown         Json
+  cancellationOverrideApplied  Boolean              @default(false)
+  status                       ClassificationStatus @default(UNCLASSIFIED)
+  createdByActorId             String               @db.Uuid
+  supersedesCaseId             String?              @unique @db.Uuid
+  /// Denormalized alongside supersedesCaseId: set true on the OLD case in
+  /// the same transaction that creates the new superseding case. A Postgres
+  /// partial unique index predicate cannot contain a subquery (it must be
+  /// immutable per-row), so "is this the live case" needs a real column,
+  /// not a computed NOT EXISTS against supersedesCaseId — see the migration
+  /// SQL's "one live case per key" indexes. Application code must keep this
+  /// and supersedesCaseId in sync; they are two views of one fact.
+  isSuperseded                 Boolean              @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  restaurant     Restaurant          @relation(fields: [restaurantId], references: [id], onDelete: Restrict)
+  aggregator     Aggregator          @relation(fields: [aggregatorId], references: [id], onDelete: Restrict)
+  createdByActor Actor               @relation(fields: [createdByActorId], references: [id], onDelete: Restrict)
+  supersedes     ReconciliationCase? @relation("CaseSupersession", fields: [supersedesCaseId], references: [id], onDelete: Restrict)
+  supersededBy   ReconciliationCase? @relation("CaseSupersession")
+
+  recordLinks         CaseRecordLink[]
+  classificationEvents ClassificationEvent[]
+  evidence            CaseEvidence[]
+  recoveryCaseLinks   RecoveryCaseReconciliationLink[]
+  recoveryAllocations RecoveryAllocation[]
+
+  @@index([restaurantId, status])
+  @@index([restaurantId, aggregatorId, orderRef])
+  @@index([restaurantId, aggregatorId, scope, periodStart])
+  @@map("reconciliation_cases")
+}
+
+/// Links a case to the specific raw record(s) it was derived from. Three
+/// nullable FKs (not a polymorphic recordType/recordId pair) so Postgres can
+/// actually enforce referential integrity and Prisma can type the relations —
+/// a polymorphic pair would give up both. Exactly one of the three must be
+/// non-null; enforced with a CHECK constraint added by hand in the generated
+/// migration SQL (Prisma does not yet express this natively).
+model CaseRecordLink {
+  id                 String  @id @default(uuid()) @db.Uuid
+  caseId             String  @db.Uuid
+  settlementRecordId String? @db.Uuid
+  posRecordId        String? @db.Uuid
+  bankRecordId       String? @db.Uuid
+
+  createdAt DateTime @default(now())
+
+  case             ReconciliationCase @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  settlementRecord SettlementRecord?  @relation(fields: [settlementRecordId], references: [id], onDelete: Cascade)
+  posRecord        POSRecord?         @relation(fields: [posRecordId], references: [id], onDelete: Cascade)
+  bankRecord       BankRecord?        @relation(fields: [bankRecordId], references: [id], onDelete: Cascade)
+
+  @@index([caseId])
+  @@map("case_record_links")
+}
+
+/// Append-only audit log — the single spine for "who changed this case's
+/// classification, when, and why". Never updated or deleted at the
+/// application layer once written.
+model ClassificationEvent {
+  id         String                @id @default(uuid()) @db.Uuid
+  caseId     String                @db.Uuid
+  actorId    String                @db.Uuid
+  fromStatus ClassificationStatus?
+  toStatus   ClassificationStatus
+  rationale  String
+
+  createdAt DateTime @default(now())
+
+  case  ReconciliationCase @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  actor Actor              @relation(fields: [actorId], references: [id], onDelete: Restrict)
+
+  @@index([caseId, createdAt])
+  @@map("classification_events")
+}
+
+enum EvidenceKind {
+  RATE_SHEET
+  CONTRACT_TERM
+  SCREENSHOT
+  NOTE
+  POLICY_DOCUMENT
+}
+
+/// Case-specific inputs backing a case's expected-amount calculation —
+/// e.g. "commission rate per this restaurant's contract = 18%, per the
+/// attached rate sheet". Rates/fees/deadlines are ALWAYS evidence scoped to
+/// one case, never a global "Zomato always charges 18%" table. The same fact
+/// may be duplicated across several cases' evidence rows if it applies to
+/// each of them — that duplication is the intended, audit-safe tradeoff, not
+/// something to "fix" later by hoisting it into a shared global table.
+model CaseEvidence {
+  id              String       @id @default(uuid()) @db.Uuid
+  caseId          String       @db.Uuid
+  actorId         String       @db.Uuid
+  kind            EvidenceKind
+  description     String
+  value           Decimal?     @db.Decimal(14, 2)
+  sourceReference String?
+  /// A rate can change mid-period — this bounds when this fact actually
+  /// applied, distinct from createdAt (when it was recorded).
+  effectiveFrom   DateTime?
+  effectiveTo     DateTime?
+  /// Confidence/status per the Phase 2 brief, kept to a plain boolean
+  /// (operator-asserted vs. checked against an actual document) rather than
+  /// a dispute-workflow enum, which would be case-management scope creep.
+  verified        Boolean      @default(false)
+
+  createdAt DateTime @default(now())
+
+  case  ReconciliationCase @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  actor Actor              @relation(fields: [actorId], references: [id], onDelete: Restrict)
+
+  @@index([caseId])
+  @@map("case_evidence")
+}
+
+// ---------------------------------------------------------------------------
+// Recovery case / Evidence Pack / Findings Report
+// (Phase 3 — case management built on top of Phase 2's Confirmed Discrepancy
+// classification. A RecoveryCase never recomputes or re-derives money: it
+// only aggregates already-confirmed ReconciliationCase.difference amounts
+// under one human-managed recovery effort, evidence pack, and findings
+// report. See CLAUDE.md's "Phase 3 decisions to preserve" for the load
+// -bearing rationale behind the design choices below.)
+// ---------------------------------------------------------------------------
+
+/// A RecoveryCase's own progress through the recovery workflow — distinct
+/// from ClientResponseStatus (what the client said). OPEN: being assembled
+/// (discrepancies/evidence can still change). REPORT_SENT: the operator has
+/// marked a FindingsReport as sent to the client; the linked discrepancy set
+/// is frozen from this point on. CLOSED: the client Declined, or a dispute
+/// disposition came back REJECTED/UNRESOLVED — nothing further to pursue.
+///
+/// The Phase 5 recovery-verification states below are entered only via an
+/// ACCEPTED/PARTIALLY_ACCEPTED dispute disposition (see
+/// src/lib/dispute/disposition.ts) and are then driven entirely by the
+/// computed recovery position (src/lib/recovery-events/position.ts) — never
+/// set directly by any action other than the state-derivation logic there,
+/// with the sole exception of RECOVERY_CLOSED_PARTIAL, which is the one
+/// explicit human override in this sub-machine. AWAITING_RECOVERY: a dispute
+/// was accepted in whole or part but no recovery has been verified yet.
+/// PARTIALLY_RECOVERED: some but not all of the confirmed amount has been
+/// verified recovered. RECOVERY_VERIFIED: the full confirmed amount has been
+/// verified recovered. RECOVERY_CLOSED_PARTIAL: a human has explicitly
+/// declared that no further recovery is expected while some amount remains
+/// outstanding — this must be invalidated and re-derived if a later
+/// void/correction changes the underlying numbers (see close-partial.ts).
+enum RecoveryCaseStatus {
+  OPEN
+  REPORT_SENT
+  CLOSED
+  AWAITING_RECOVERY
+  PARTIALLY_RECOVERED
+  RECOVERY_VERIFIED
+  RECOVERY_CLOSED_PARTIAL
+}
+
+/// What the client said, recorded manually by the operator after an
+/// out-of-system conversation — never inferred, never linked to an
+/// automated approval flow. AWAITING is the default until an operator
+/// records an actual response.
+enum ClientResponseStatus {
+  AWAITING
+  APPROVED
+  DECLINED
+}
+
+/// The append-only audit spine for RecoveryCase, mirroring the
+/// ClassificationEvent pattern rather than inventing a new mechanism.
+/// `metadata` carries kind-specific structured detail (e.g. which
+/// reconciliationCaseId was linked, the report version generated) so the
+/// human-readable `note` never has to encode machine-parseable facts.
+enum RecoveryCaseEventKind {
+  CASE_CREATED
+  DISCREPANCY_LINKED
+  DISCREPANCY_UNLINKED
+  EVIDENCE_ITEM_ADDED
+  EVIDENCE_ITEM_UPDATED
+  EVIDENCE_ITEM_REMOVED
+  OVERLAP_REVIEWED
+  REPORT_GENERATED
+  REPORT_MARKED_SENT
+  CLIENT_RESPONSE_RECORDED
+  STATUS_CHANGED
+  DISPUTE_SUBMISSION_CREATED
+  DISPUTE_SUBMISSION_SUPERSEDED
+  VERIFIED_DEADLINE_SET
+  FOLLOW_UP_ADDED
+  DISPOSITION_RECORDED
+  RECOVERY_RECORDED
+  RECOVERY_VOIDED
+  RECOVERY_CLOSED_PARTIAL_DECLARED
+}
+
+/// The six controlled Evidence Pack categories, as a reference table (not a
+/// native enum) so a labeling correction or a genuinely new category never
+/// requires a schema migration — only a data change. `isConditional` is a
+/// descriptive flag for the UI; the actual applicability RULE for a
+/// conditional category (e.g. BankCreditEvidence is required only when a
+/// BANK_CYCLE item is linked) lives in code
+/// (`src/lib/recovery/evidence-readiness.ts`), because a generic
+/// "conditional" flag alone can't express an arbitrary future rule.
+/// Do NOT add "ClientWrittenApproval" here — client approval's authoritative
+/// home is RecoveryCase.clientResponseStatus below; duplicating it as an
+/// evidence category would create a second, conflicting source of truth for
+/// the same fact.
+model EvidenceCategory {
+  code          String  @id
+  label         String
+  isConditional Boolean @default(false)
+  active        Boolean @default(true)
+  sortOrder     Int     @default(0)
+
+  items EvidenceItem[]
+
+  @@map("evidence_categories")
+}
+
+/// One recovery effort for a restaurant/aggregator, built from one or more
+/// linked Confirmed Discrepancy ReconciliationCases (order-level and/or
+/// bank-cycle). `restaurantId`/`aggregatorId` are stored here (not derived
+/// solely from linked items) so a case with zero links can still exist
+/// meaningfully during creation, and so every linked item's own
+/// restaurant/aggregator can be validated against a single fixed reference
+/// at link time.
+///
+/// There is deliberately NO stored "confirmedTotal" column — the confirmed
+/// amount is always computed at read time from currently-eligible linked
+/// ReconciliationCases (see `src/lib/recovery/confirmed-total.ts`), per the
+/// explicit instruction that it must never become an independently-entered
+/// parallel source of truth. The same applies to evidence readiness: no
+/// stored "ready" flag, always derived.
+model RecoveryCase {
+  id                   String               @id @default(uuid()) @db.Uuid
+  restaurantId         String               @db.Uuid
+  aggregatorId         String               @db.Uuid
+  status               RecoveryCaseStatus   @default(OPEN)
+  clientResponseStatus ClientResponseStatus @default(AWAITING)
+  clientResponseDate   DateTime?
+  clientResponseNote   String?
+  /// Case-level overlap checkpoint (see RecoveryCaseReconciliationLink and
+  /// confirmed-total.ts for the detection rule this gates). Reset to
+  /// false/null by application code whenever the linked-item set changes,
+  /// so a stale review can never silently cover a newly-introduced overlap.
+  overlapReviewed      Boolean              @default(false)
+  overlapReviewNote    String?
+  reportSentAt         DateTime?
+  closedAt             DateTime?
+  createdByActorId     String               @db.Uuid
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  restaurant     Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Restrict)
+  aggregator     Aggregator @relation(fields: [aggregatorId], references: [id], onDelete: Restrict)
+  createdByActor Actor      @relation(fields: [createdByActorId], references: [id], onDelete: Restrict)
+
+  links   RecoveryCaseReconciliationLink[]
+  evidence EvidenceItem[]
+  reports FindingsReport[]
+  events  RecoveryCaseEvent[]
+  disputeSubmissions DisputeSubmission[]
+  recoveryEvents RecoveryEvent[]
+
+  @@index([restaurantId, aggregatorId, status])
+  @@map("recovery_cases")
+}
+
+/// The generic join between a RecoveryCase and any eligible ReconciliationCase
+/// (ORDER_LEVEL or BANK_CYCLE alike — deliberately ONE join model, not
+/// separate order-link/bank-link tables, since the eligibility rule and the
+/// "one open case at a time" invariant are identical for both scopes).
+///
+/// `releasedAt` is the mechanism behind "a ReconciliationCase may belong to
+/// only one OPEN RecoveryCase at a time, but can join a new one after the
+/// old one closes": it is set (by application code, in the same transaction
+/// that closes/unlinks) when the discrepancy is no longer held by an open
+/// case, never by deleting the row — so a discrepancy's full recovery-case
+/// history stays queryable. A hand-written partial unique index (see
+/// migration SQL) enforces `releasedAt IS NULL` uniqueness on
+/// `reconciliationCaseId` — a same-table predicate, not a cross-table CHECK,
+/// which Postgres cannot express. The "classification is currently Confirmed
+/// Discrepancy" eligibility rule is NOT expressible as any kind of DB
+/// constraint (it depends on another table's live value) — it is enforced in
+/// `src/lib/recovery/create-recovery-case.ts` by reading and row-locking the
+/// target ReconciliationCase inside the same transaction before inserting
+/// this row.
+model RecoveryCaseReconciliationLink {
+  id                   String    @id @default(uuid()) @db.Uuid
+  recoveryCaseId       String    @db.Uuid
+  reconciliationCaseId String    @db.Uuid
+  linkedAt             DateTime  @default(now())
+  linkedByActorId      String    @db.Uuid
+  releasedAt           DateTime?
+  releasedByActorId    String?   @db.Uuid
+
+  recoveryCase       RecoveryCase       @relation(fields: [recoveryCaseId], references: [id], onDelete: Cascade)
+  reconciliationCase ReconciliationCase @relation(fields: [reconciliationCaseId], references: [id], onDelete: Restrict)
+  linkedByActor      Actor              @relation("RecoveryCaseLinkLinkedBy", fields: [linkedByActorId], references: [id], onDelete: Restrict)
+  releasedByActor    Actor?             @relation("RecoveryCaseLinkReleasedBy", fields: [releasedByActorId], references: [id], onDelete: Restrict)
+
+  @@index([recoveryCaseId])
+  @@index([reconciliationCaseId])
+  @@map("recovery_case_reconciliation_links")
+}
+
+/// Presence of one Evidence Pack category for one RecoveryCase — existence
+/// of a row IS the presence signal (see EvidenceCategory doc comment); there
+/// is no separate boolean to fall out of sync with row existence.
+/// `@@unique([recoveryCaseId, categoryCode])` makes "add evidence for a
+/// category" an upsert rather than allowing duplicate/ambiguous rows per
+/// category.
+model EvidenceItem {
+  id             String  @id @default(uuid()) @db.Uuid
+  recoveryCaseId String  @db.Uuid
+  categoryCode   String
+  reference      String?
+  note           String?
+  actorId        String  @db.Uuid
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  recoveryCase RecoveryCase     @relation(fields: [recoveryCaseId], references: [id], onDelete: Cascade)
+  category     EvidenceCategory @relation(fields: [categoryCode], references: [code], onDelete: Restrict)
+  actor        Actor            @relation(fields: [actorId], references: [id], onDelete: Restrict)
+
+  @@unique([recoveryCaseId, categoryCode])
+  @@map("evidence_items")
+}
+
+/// A generated, versioned snapshot of a RecoveryCase's findings — never
+/// overwritten. `content` is a self-contained JSON snapshot (confirmed
+/// total, included/blocked line items, overlap-review status at generation
+/// time) captured at `generatedAt`, so a historical report stays accurate
+/// even if the underlying ReconciliationCase data is later reclassified or
+/// superseded. `sentAt`/`sentByActorId`/`sentVia` are populated only by the
+/// manual "mark as sent" action — there is no automated delivery path.
+model FindingsReport {
+  id                 String    @id @default(uuid()) @db.Uuid
+  recoveryCaseId     String    @db.Uuid
+  version            Int
+  content            Json
+  generatedAt        DateTime  @default(now())
+  generatedByActorId String    @db.Uuid
+  sentAt             DateTime?
+  sentByActorId      String?   @db.Uuid
+  sentVia            String?
+
+  recoveryCase     RecoveryCase @relation(fields: [recoveryCaseId], references: [id], onDelete: Cascade)
+  generatedByActor Actor        @relation("FindingsReportGeneratedBy", fields: [generatedByActorId], references: [id], onDelete: Restrict)
+  sentByActor      Actor?       @relation("FindingsReportSentBy", fields: [sentByActorId], references: [id], onDelete: Restrict)
+
+  @@unique([recoveryCaseId, version])
+  @@map("findings_reports")
+}
+
+/// Append-only audit log for everything that happens to a RecoveryCase —
+/// the Phase 3 extension of the same pattern ClassificationEvent already
+/// established for ReconciliationCase. Never updated or deleted at the
+/// application layer once written.
+model RecoveryCaseEvent {
+  id             String                @id @default(uuid()) @db.Uuid
+  recoveryCaseId String                @db.Uuid
+  actorId        String                @db.Uuid
+  kind           RecoveryCaseEventKind
+  note           String?
+  metadata       Json?
+
+  createdAt DateTime @default(now())
+
+  recoveryCase RecoveryCase @relation(fields: [recoveryCaseId], references: [id], onDelete: Cascade)
+  actor        Actor        @relation(fields: [actorId], references: [id], onDelete: Restrict)
+
+  @@index([recoveryCaseId, createdAt])
+  @@map("recovery_case_events")
+}
+
+// ---------------------------------------------------------------------------
+// Dispute lifecycle (Phase 4 — what happens after client approval, stopping
+// at aggregator disposition). Aggregator disposition is NOT recovery: an
+// Accepted/Partially Accepted outcome means only "the aggregator says the
+// claim is accepted in whole or part" — it must never be read as money
+// received, an amount recovered, a success fee earned, or an invoice due.
+// Those are Phase 5 concerns; nothing here computes or stores any of them.
+// See CLAUDE.md's "Phase 4 dispute-lifecycle decisions to preserve".
+// ---------------------------------------------------------------------------
+
+/// How the human submitted the dispute (or logged a follow-up) — a fixed,
+/// small, stable set, so a native enum (unlike Evidence Pack categories,
+/// which needed a reference table specifically because that toolkit is
+/// expected to be corrected/extended). OTHER_OFFICIAL_CHANNEL is the escape
+/// hatch for anything not explicitly listed — never automation, an API
+/// integration, or a scraped/logged-in session; this only records what a
+/// human did externally.
+enum SubmissionChannel {
+  AGGREGATOR_PORTAL
+  EMAIL
+  OFFICIAL_SUPPORT
+  OTHER_OFFICIAL_CHANNEL
+}
+
+/// How sure we are about a DisputeSubmission's deadline. UNKNOWN and
+/// ASSUMED_DEFAULT are software-reachable (via a DeadlineAssumptionPolicy or
+/// nothing at all); every VERIFIED_* value can only be set by an explicit
+/// human action (`setVerifiedDeadline`) — the software never silently
+/// upgrades an assumption to verified.
+enum DeadlineConfidence {
+  UNKNOWN
+  ASSUMED_DEFAULT
+  VERIFIED_PLATFORM_POLICY
+  VERIFIED_CONTRACT
+  VERIFIED_PRIOR_CASE
+}
+
+/// The human-recorded result of a dispute submission. Never inferred from
+/// free text. UNRESOLVED is itself an explicit human decision ("we consider
+/// this attempt stalled/exhausted") — the software must never mark
+/// something unresolved merely because time passed.
+enum DisputeOutcome {
+  ACCEPTED
+  PARTIALLY_ACCEPTED
+  REJECTED
+  UNRESOLVED
+}
+
+/// A working-assumption dispute deadline, as controlled, evidenced,
+/// per-aggregator data — never a hardcoded Swiggy/Zomato constant in
+/// application code (see CLAUDE.md rule 10). A row existing here is NOT by
+/// itself a verified platform fact; it is only ever a candidate the
+/// operator may explicitly choose to apply when creating a submission
+/// (never auto-matched/auto-applied). `category` is descriptive only (e.g.
+/// "order-level shortfall" vs "settlement-cycle shortfall"), to help an
+/// operator pick the right row — it is not used for automatic matching
+/// logic, which would risk silently applying the wrong assumption.
+model DeadlineAssumptionPolicy {
+  id           String  @id @default(uuid()) @db.Uuid
+  aggregatorId String  @db.Uuid
+  category     String?
+  defaultDays  Int
+  sourceNote   String
+  active       Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  aggregator  Aggregator          @relation(fields: [aggregatorId], references: [id], onDelete: Restrict)
+  submissions DisputeSubmission[]
+
+  @@index([aggregatorId, active])
+  @@map("deadline_assumption_policies")
+}
+
+/// One dispute-submission attempt for a RecoveryCase. Only an
+/// eligible client-approved case may receive one (enforced in
+/// src/lib/dispute/eligibility.ts, the same row-lock pattern as Phase 3's
+/// recovery-case linking — a plain CHECK constraint cannot read another
+/// table's live value). At most one ACTIVE submission exists per
+/// RecoveryCase at a time (hand-written partial unique index — see
+/// migration SQL); a resubmission supersedes the prior active row
+/// (`isActive = false`, `supersededAt`/`supersededByActorId` set) rather
+/// than mutating it, so the full submission history stays queryable.
+///
+/// `evidenceSnapshot` is a frozen, self-contained JSON copy of what was
+/// actually relied upon at submission time (the referenced FindingsReport's
+/// own already-immutable `content`, plus the live EvidenceItem rows copied
+/// forward as of that moment) — never a live pointer that could later
+/// resolve to changed data. Later edits to the case's evidence pack or new
+/// findings-report generations must not alter this snapshot.
+///
+/// Deadline fields distinguish an operator's working assumption from a
+/// human-verified fact: `effectiveDeadline` is deliberately NOT a stored
+/// column — it is always `verifiedDeadline ?? workingAssumptionDeadline`,
+/// computed at read time (src/lib/dispute/deadline.ts) exactly like Phase
+/// 3's confirmed total is never a stored figure.
+model DisputeSubmission {
+  id                        String             @id @default(uuid()) @db.Uuid
+  recoveryCaseId            String             @db.Uuid
+  ticketOrReferenceNumber   String?
+  channel                   SubmissionChannel
+  submittedAt               DateTime
+  /// Human-verified deadline, settable only via an explicit action after
+  /// creation (never silently upgraded from an assumption).
+  verifiedDeadline          DateTime?
+  deadlineSourceEvidence    String?
+  deadlineConfidence        DeadlineConfidence @default(UNKNOWN)
+  /// Frozen at submission time as submittedAt + the selected policy's
+  /// defaultDays — never recomputed later even if the policy row changes.
+  workingAssumptionDeadline DateTime?
+  assumptionPolicyId        String?            @db.Uuid
+  evidenceSnapshot          Json
+  isActive                  Boolean            @default(true)
+  supersededAt              DateTime?
+  supersededByActorId       String?            @db.Uuid
+  createdByActorId          String             @db.Uuid
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  recoveryCase      RecoveryCase              @relation(fields: [recoveryCaseId], references: [id], onDelete: Restrict)
+  assumptionPolicy  DeadlineAssumptionPolicy? @relation(fields: [assumptionPolicyId], references: [id], onDelete: Restrict)
+  createdByActor    Actor                     @relation("DisputeSubmissionCreatedBy", fields: [createdByActorId], references: [id], onDelete: Restrict)
+  supersededByActor Actor?                    @relation("DisputeSubmissionSupersededBy", fields: [supersededByActorId], references: [id], onDelete: Restrict)
+
+  followUps   FollowUpEntry[]
+  disposition DisputeDisposition?
+  recoveryEvents RecoveryEvent[]
+
+  @@index([recoveryCaseId])
+  @@map("dispute_submissions")
+}
+
+/// A human-logged factual record of one follow-up contact, tied to the
+/// SPECIFIC submission attempt it happened under (never directly to the
+/// RecoveryCase) — so follow-up history stays correctly attached to its own
+/// attempt across a resubmission. Append-only: entries are never edited or
+/// deleted once recorded. No automated sending or reminders exist anywhere
+/// in this model — it only records what a human already did.
+model FollowUpEntry {
+  id                  String            @id @default(uuid()) @db.Uuid
+  disputeSubmissionId String            @db.Uuid
+  occurredAt          DateTime
+  channel             SubmissionChannel
+  actorId             String            @db.Uuid
+  summary             String
+  aggregatorResponse  String?
+  nextAction          String?
+
+  createdAt DateTime @default(now())
+
+  disputeSubmission DisputeSubmission @relation(fields: [disputeSubmissionId], references: [id], onDelete: Cascade)
+  actor             Actor             @relation(fields: [actorId], references: [id], onDelete: Restrict)
+
+  @@index([disputeSubmissionId, occurredAt])
+  @@map("follow_up_entries")
+}
+
+/// The human-recorded terminal outcome of one DisputeSubmission — at most
+/// one per submission (`@unique` on disputeSubmissionId), never inferred
+/// from free text. `aggregatorStatedAmount` (when present) is exactly what
+/// its name says: a fact about what the aggregator claims, not a record of
+/// money received — no Phase 4 code may read it as recovered cash. Recording
+/// REJECTED or UNRESOLVED here closes the owning RecoveryCase; ACCEPTED and
+/// PARTIALLY_ACCEPTED leave it open for Phase 5 recovery verification (see
+/// src/lib/dispute/disposition.ts).
+model DisputeDisposition {
+  id                     String         @id @default(uuid()) @db.Uuid
+  disputeSubmissionId    String         @unique @db.Uuid
+  outcome                DisputeOutcome
+  decidedAt              DateTime
+  decidedByActorId       String         @db.Uuid
+  evidenceNote           String
+  /// What the aggregator says was accepted — never "recovered". No balance,
+  /// invoice, or success-fee logic anywhere may treat this as cash in hand.
+  aggregatorStatedAmount Decimal?       @db.Decimal(14, 2)
+
+  createdAt DateTime @default(now())
+
+  disputeSubmission DisputeSubmission @relation(fields: [disputeSubmissionId], references: [id], onDelete: Cascade)
+  decidedByActor    Actor             @relation(fields: [decidedByActorId], references: [id], onDelete: Restrict)
+  recoveryEvents    RecoveryEvent[]
+
+  @@map("dispute_dispositions")
+}
+
+// ---------------------------------------------------------------------------
+// Recovery verification (Phase 5 — what happens after an aggregator
+// disposition is ACCEPTED or PARTIALLY_ACCEPTED). An aggregator disposition
+// is NOT recovery: it is only ever read-only context here (see
+// DisputeDisposition.aggregatorStatedAmount above). No RecoveryEvent or
+// RecoveryAllocation is ever created automatically from a disposition — a
+// human must separately verify that money actually arrived (or a later
+// settlement record actually proves a promised offset occurred) before any
+// amount here exists. Success fee, invoicing, and payment collection are
+// explicitly NOT modeled anywhere in this schema — those are Phase 6+
+// concerns. See CLAUDE.md's "Phase 5 recovery-verification decisions to
+// preserve".
+// ---------------------------------------------------------------------------
+
+enum RecoveryMethod {
+  DIRECT_BANK_CREDIT
+  FUTURE_SETTLEMENT_OFFSET
+  OTHER_EVIDENCED_METHOD
+}
+
+/// ACTIVE is the only status that counts toward Verified Recovered/Outstanding
+/// anywhere in this codebase — every aggregate in
+/// src/lib/recovery-events/position.ts filters on it explicitly. VOIDED is a
+/// permanent correction marker, never a delete: the original amount, method,
+/// date, evidence, and allocations remain queryable forever (see
+/// RecoveryEvent's own doc comment).
+enum RecoveryEventStatus {
+  ACTIVE
+  VOIDED
+}
+
+/// One human-verified fact that money was actually observed to have arrived
+/// (or a promised future-settlement offset actually appeared in a later
+/// settlement record) — the append-only financial ledger this phase exists
+/// to build. Always traces back to the specific DisputeSubmission and
+/// DisputeDisposition that made the owning RecoveryCase recovery-eligible in
+/// the first place (both required, not merely a RecoveryCase-level pointer),
+/// even though a disposition is 1:1 with its submission — the direct FK to
+/// both keeps that provenance explicit rather than requiring a join through
+/// DisputeDisposition every time.
+///
+/// This is never hard-deleted. A correction is always: void the erroneous
+/// event (`status = VOIDED`, `voidedAt`/`voidedByActorId`/`voidReason` all
+/// required together), then create a brand-new RecoveryEvent with
+/// `supersedesEventId` pointing at the voided one and its own fresh
+/// RecoveryAllocation rows. The original event's own facts (amount, method,
+/// occurredAt, evidence, allocations) are never edited in place.
+///
+/// `evidenceReference`/`normalizedEvidenceReference` are always required,
+/// even when `bankRecordId`/`settlementRecordId` links to an imported
+/// proving row — they are the operator's human-readable description of what
+/// was relied upon either way; the imported-row FK is the STRONGER
+/// provenance signal when present (see the duplicate-prevention partial
+/// unique indexes in the migration SQL), and the evidence-reference fields
+/// are the ONLY provenance signal for OTHER_EVIDENCED_METHOD, or as a
+/// genuine fallback for DIRECT_BANK_CREDIT when no matching imported
+/// BankRecord exists yet. FUTURE_SETTLEMENT_OFFSET has NO such fallback —
+/// `settlementRecordId` is mandatory for that method (enforced in
+/// src/lib/recovery-events/create-event.ts): a promise, email, or ticket
+/// response saying "will be adjusted" is explicitly insufficient evidence
+/// that an offset actually occurred, and unlike a bank credit there is no
+/// other real-world signal strong enough to accept in its place.
+/// `normalizedEvidenceReference` is a deterministic, pure function of
+/// `evidenceReference` (see src/lib/recovery-events/normalize.ts) computed
+/// at write time — never independently entered.
+///
+/// The hard allocation cap (`SUM(allocatedAmount) across this
+/// ReconciliationCase's ACTIVE RecoveryEvents <= its confirmed amount`) and
+/// the `0 < SUM(allocations) <= amount` invariant cannot be expressed as a
+/// row-local CHECK constraint (both depend on other rows/tables) — they are
+/// enforced transactionally with row locking in
+/// src/lib/recovery-events/create-event.ts, never left to the frontend.
+model RecoveryEvent {
+  id                           String              @id @default(uuid()) @db.Uuid
+  recoveryCaseId               String              @db.Uuid
+  disputeSubmissionId          String              @db.Uuid
+  disputeDispositionId         String              @db.Uuid
+  method                       RecoveryMethod
+  amount                       Decimal             @db.Decimal(14, 2)
+  occurredAt                   DateTime
+  evidenceReference            String
+  normalizedEvidenceReference  String
+  operatorNote                 String?
+  verifiedByActorId            String              @db.Uuid
+  verifiedAt                   DateTime
+  status                       RecoveryEventStatus @default(ACTIVE)
+  supersedesEventId            String?             @unique @db.Uuid
+  bankRecordId                 String?             @db.Uuid
+  settlementRecordId           String?             @db.Uuid
+  voidedAt                     DateTime?
+  voidedByActorId              String?             @db.Uuid
+  /// Required together with voidedAt/voidedByActorId whenever status =
+  /// VOIDED — a hand-written CHECK constraint backs this (see migration SQL)
+  /// on top of the application-layer enforcement in void-event.ts.
+  voidReason                   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  recoveryCase       RecoveryCase       @relation(fields: [recoveryCaseId], references: [id], onDelete: Restrict)
+  disputeSubmission  DisputeSubmission  @relation(fields: [disputeSubmissionId], references: [id], onDelete: Restrict)
+  disputeDisposition DisputeDisposition @relation(fields: [disputeDispositionId], references: [id], onDelete: Restrict)
+  bankRecord         BankRecord?        @relation(fields: [bankRecordId], references: [id], onDelete: Restrict)
+  settlementRecord   SettlementRecord?  @relation(fields: [settlementRecordId], references: [id], onDelete: Restrict)
+  verifiedByActor    Actor              @relation("RecoveryEventVerifiedBy", fields: [verifiedByActorId], references: [id], onDelete: Restrict)
+  voidedByActor      Actor?             @relation("RecoveryEventVoidedBy", fields: [voidedByActorId], references: [id], onDelete: Restrict)
+  supersedes         RecoveryEvent?     @relation("RecoveryEventSupersession", fields: [supersedesEventId], references: [id], onDelete: Restrict)
+  supersededBy       RecoveryEvent?     @relation("RecoveryEventSupersession")
+
+  allocations RecoveryAllocation[]
+
+  @@index([recoveryCaseId])
+  @@map("recovery_events")
+}
+
+/// How much of one RecoveryEvent's observed amount counts toward one specific
+/// ReconciliationCase's Verified Recovered/Outstanding. Deliberately
+/// individual-ReconciliationCase-level, never a pooled RecoveryCase-level
+/// figure — a RecoveryEvent may allocate across several of its RecoveryCase's
+/// linked ReconciliationCases in one transaction. Only ever created alongside
+/// its RecoveryEvent, in the same transaction, and never edited or deleted
+/// afterward: a correction always means voiding the RecoveryEvent and
+/// creating a new one with new allocation rows, never mutating these. An
+/// allocation only counts as "active" transitively, via its RecoveryEvent's
+/// own `status` — there is no separate status column here to fall out of
+/// sync with that.
+model RecoveryAllocation {
+  id                   String  @id @default(uuid()) @db.Uuid
+  recoveryEventId      String  @db.Uuid
+  reconciliationCaseId String  @db.Uuid
+  allocatedAmount      Decimal @db.Decimal(14, 2)
+
+  createdAt DateTime @default(now())
+
+  recoveryEvent      RecoveryEvent      @relation(fields: [recoveryEventId], references: [id], onDelete: Restrict)
+  reconciliationCase ReconciliationCase @relation(fields: [reconciliationCaseId], references: [id], onDelete: Restrict)
+
+  @@unique([recoveryEventId, reconciliationCaseId])
+  @@index([reconciliationCaseId])
+  @@map("recovery_allocations")
+}
